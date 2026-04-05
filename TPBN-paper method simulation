@@ -1,0 +1,303 @@
+# ============================================================
+# Version 2 (update R_beta via onion/LKJ) + Laplacian prior
+# CHANGE:
+#   - Run R = 100 replicates
+#   - In each replicate, store last K = 150 beta draws
+#   - Compute per-replicate median beta (length p)
+#   - Across 100 replicates: compute mean and sd of these medians (per beta_j)
+# OUTPUT:
+#   - beta_med_mat: 100 x 20 matrix (replicate medians)
+#   - summary table: mean_med[j], sd_med[j]
+# ============================================================
+
+set.seed(123)
+library(MASS)
+
+# -----------------------------
+# 0) Utilities
+# -----------------------------
+is_spd <- function(M) {
+  out <- try(chol(M), silent = TRUE)
+  !inherits(out, "try-error")
+}
+
+rlkj_onion <- function(K, eta = 1) {
+  if (K < 2) return(matrix(1, 1, 1))
+  
+  beta_par <- eta + (K - 2) / 2
+  u <- rbeta(1, beta_par, beta_par)
+  r12 <- 2*u - 1
+  R <- matrix(c(1, r12, r12, 1), 2, 2)
+  
+  for (m in 2:(K-1)) {
+    beta_par <- beta_par - 0.5
+    y <- rbeta(1, shape1 = m/2, shape2 = beta_par)
+    
+    z <- rnorm(m); z <- z / sqrt(sum(z^2))
+    w <- sqrt(y) * z
+    
+    A <- chol(R)
+    q <- as.vector(t(A) %*% w)
+    
+    R_new <- matrix(0, m+1, m+1)
+    R_new[1:m, 1:m] <- R
+    R_new[1:m, m+1] <- q
+    R_new[m+1, 1:m] <- q
+    R_new[m+1, m+1] <- 1
+    R <- R_new
+  }
+  R
+}
+
+log_gamma_shape_rate <- function(x, shape, rate) {
+  if (!is.finite(x) || x <= 0) return(-Inf)
+  (shape - 1) * log(x) - rate * x - lgamma(shape) + shape * log(rate)
+}
+
+make_Sig_beta <- function(psi, R, L, phi = 1, jitter = 1e-8) {
+  D <- diag(sqrt(psi))
+  Sig <- D %*% R %*% D + phi * L
+  Sig <- Sig + jitter * diag(nrow(Sig))
+  Sig
+}
+
+log_prior_beta <- function(beta, sigma2, psi, R, L, phi = 1) {
+  if (sigma2 <= 0 || any(psi <= 0)) return(-Inf)
+  if (!is_spd(R)) return(-Inf)
+  
+  Sig <- make_Sig_beta(psi, R, L, phi = phi, jitter = 1e-8)
+  if (!is_spd(Sig)) return(-Inf)
+  
+  cholS <- chol(Sig)
+  logdetS <- 2 * sum(log(diag(cholS)))
+  
+  v <- backsolve(cholS, beta, transpose = TRUE)
+  quad <- sum(v^2)
+  
+  p <- length(beta)
+  -0.5 * (p * log(sigma2) + logdetS + quad / sigma2)
+}
+
+# -----------------------------
+# 1) Fixed settings
+# -----------------------------
+n <- 50
+
+beta1_true <- c(1, 2)
+beta2_true <- c(-1, -1, 2)
+beta3_true <- c(3, -2)
+beta_noise_true <- rep(0, 13)
+
+beta_true <- c(beta1_true, beta2_true, beta3_true, beta_noise_true)
+p <- length(beta_true)  # 20
+
+sigma2_true <- 1
+
+# Hyperparameters
+u <- 0.5
+a <- 0.5
+tau_scale <- function(p, n) 1 / (p * sqrt(n * log(n)))
+eta_lkj <- 1
+d <- 3
+phi <- 1
+
+# MCMC
+n_iter <- 7000
+burnin <- 2000  # not used for median-from-lastK, but kept for consistency
+K_keep <- 150L
+start_keep_beta <- n_iter - K_keep + 1L
+
+# Replicates
+R <- 100L
+
+# Store per-replicate medians (100 x 20)
+beta_med_mat <- matrix(NA_real_, nrow = R, ncol = p)
+colnames(beta_med_mat) <- paste0("beta", 1:p)
+rownames(beta_med_mat) <- paste0("rep", 1:R)
+
+# (optional) track acceptance rates
+accR_vec <- numeric(R)
+accPsi_min <- numeric(R)
+accPsi_med <- numeric(R)
+accPsi_max <- numeric(R)
+
+# -----------------------------
+# 2) Replicate loop
+# -----------------------------
+for (rr in 1:R) {
+  cat("\nReplicate:", rr, "/", R, "\n")
+  
+  # ----- Data generation (same as your current code: correlated blocks, not exact duplicates)
+  Sigma1 <- matrix(c(1, 1, 1, 1), 2, 2)
+  X1 <- mvrnorm(n, mu = c(0, 0), Sigma = Sigma1)
+  
+  Sigma2 <- matrix(c(1, 1, 1,
+                     1, 1, 1,
+                     1, 1, 1), 3, 3)
+  X2 <- mvrnorm(n, mu = c(0, 0, 0), Sigma = Sigma2)
+  
+  Sigma3 <- diag(2)
+  X3 <- mvrnorm(n, mu = c(0, 0), Sigma = Sigma3)
+  
+  X4 <- matrix(rnorm(n * 13), n, 13)
+  
+  X <- cbind(X1, X2, X3, X4)  # n x 20
+  y <- as.numeric(X %*% beta_true + rnorm(n, 0, sqrt(sigma2_true)))
+  
+  # ----- Laplacian L
+  CorX <- cor(X)
+  W <- abs(CorX) * (abs(CorX) > 0.3)
+  diag(W) <- 0
+  Deg <- diag(rowSums(W))
+  L <- Deg - W
+  trL <- sum(diag(L))
+  if (trL > 0) L <- (p / trL) * L
+  
+  # ----- tau
+  tau <- tau_scale(p, n)
+  
+  # ----- k for Inv-Gamma prior on sigma2 (rank-deficient safe)
+  beta_ls <- MASS::ginv(t(X) %*% X) %*% t(X) %*% y
+  k <- var(y - as.numeric(X %*% beta_ls))
+  if (!is.finite(k) || k <= 0) k <- var(y)
+  
+  # ----- Precompute
+  XtX <- t(X) %*% X
+  Xty <- as.numeric(t(X) %*% y)
+  
+  # ----- Initialize
+  beta <- rep(0, p)
+  sigma2 <- k
+  psi  <- rep(1, p)
+  zeta <- rep(1, p)
+  
+  R_beta <- rlkj_onion(p, eta = eta_lkj)
+  if (!is_spd(R_beta)) stop("Initial R_beta not SPD (unexpected).")
+  
+  prop_sd_psi <- rep(0.20, p)
+  acc_psi <- integer(p)
+  acc_R <- 0L
+  
+  # store last K_keep betas only
+  beta_lastK <- matrix(NA_real_, nrow = K_keep, ncol = p)
+  kk <- 0L
+  
+  # ----- MCMC
+  for (iter in 1:n_iter) {
+    
+    # (1) beta | ...
+    Sig_beta <- make_Sig_beta(psi, R_beta, L, phi = phi, jitter = 1e-8)
+    if (!is_spd(Sig_beta)) {
+      Sig_beta <- make_Sig_beta(psi, R_beta, L, phi = phi, jitter = 1e-6)
+      if (!is_spd(Sig_beta)) stop("Sigma_beta not SPD; increase jitter or change W threshold.")
+    }
+    Sig_beta_inv <- solve(Sig_beta)
+    
+    Prec <- (XtX + Sig_beta_inv) / sigma2
+    V <- solve(Prec)
+    m <- V %*% (Xty / sigma2)
+    
+    beta <- as.numeric(m + t(chol(V)) %*% rnorm(p))
+    
+    # (2) sigma2 | ...  (RSS + quad_beta)
+    resid <- y - as.numeric(X %*% beta)
+    RSS <- sum(resid^2)
+    
+    quad_beta <- as.numeric(t(beta) %*% solve(Sig_beta, beta))
+    
+    shape_sig <- (d + n + p) / 2
+    rate_sig  <- (k + RSS + quad_beta) / 2
+    sigma2 <- 1 / rgamma(1, shape = shape_sig, rate = rate_sig)
+    
+    # (3) psi_j | ... (MH)
+    for (j in 1:p) {
+      logpsi_curr <- log(psi[j])
+      logpsi_prop <- logpsi_curr + rnorm(1, 0, prop_sd_psi[j])
+      psi_prop <- psi
+      psi_prop[j] <- exp(logpsi_prop)
+      
+      logt_curr <- log_prior_beta(beta, sigma2, psi,      R_beta, L, phi = phi) +
+        log_gamma_shape_rate(psi[j],      shape = u, rate = zeta[j])
+      
+      logt_prop <- log_prior_beta(beta, sigma2, psi_prop, R_beta, L, phi = phi) +
+        log_gamma_shape_rate(psi_prop[j], shape = u, rate = zeta[j])
+      
+      log_alpha <- (logt_prop - logt_curr) + (logpsi_prop - logpsi_curr)
+      
+      if (log(runif(1)) < log_alpha) {
+        psi <- psi_prop
+        acc_psi[j] <- acc_psi[j] + 1
+      }
+    }
+    
+    # (4) zeta_j | psi_j
+    for (j in 1:p) {
+      zeta[j] <- rgamma(1, shape = a + u, rate = tau + psi[j])
+    }
+    
+    # (5) R_beta | ...  (MH with onion proposal)
+    R_prop <- rlkj_onion(p, eta = eta_lkj)
+    if (is_spd(R_prop)) {
+      logt_curr <- log_prior_beta(beta, sigma2, psi, R_beta, L, phi = phi)
+      logt_prop <- log_prior_beta(beta, sigma2, psi, R_prop, L, phi = phi)
+      
+      if (log(runif(1)) < (logt_prop - logt_curr)) {
+        R_beta <- R_prop
+        acc_R <- acc_R + 1L
+      }
+    }
+    
+    # store last K_keep
+    if (iter >= start_keep_beta) {
+      kk <- kk + 1L
+      beta_lastK[kk, ] <- beta
+    }
+  }
+  
+  # ----- per-replicate median from last K_keep draws
+  beta_med <- apply(beta_lastK, 2, median, na.rm = TRUE)
+  beta_med_mat[rr, ] <- beta_med
+  
+  # ----- acceptance summaries (optional)
+  accR_vec[rr] <- acc_R / n_iter
+  accPsi_min[rr] <- min(acc_psi / n_iter)
+  accPsi_med[rr] <- median(acc_psi / n_iter)
+  accPsi_max[rr] <- max(acc_psi / n_iter)
+  
+  cat("  done. acc_R=", round(accR_vec[rr], 3),
+      " acc_psi(min/med/max)=",
+      round(accPsi_min[rr],3), "/",
+      round(accPsi_med[rr],3), "/",
+      round(accPsi_max[rr],3), "\n")
+}
+
+# -----------------------------
+# 3) Across-replicate mean/sd of medians (per beta_j)
+# -----------------------------
+mean_med <- colMeans(beta_med_mat, na.rm = TRUE)
+sd_med <- apply(beta_med_mat, 2, sd, na.rm = TRUE)
+
+summary_tab <- data.frame(
+  beta = paste0("beta", 1:p),
+  true = beta_true,
+  mean_median = mean_med,
+  sd_median = sd_med,
+  row.names = NULL
+)
+
+cat("\n============================\n")
+cat("Across 100 replicates: mean & sd of per-replicate medians (last 150 draws)\n")
+cat("============================\n\n")
+print(summary_tab)
+
+# Optional: acceptance diagnostics across replicates
+cat("\nAcceptance diagnostics across replicates:\n")
+cat("acc_R   : mean=", round(mean(accR_vec),3), " sd=", round(sd(accR_vec),3), "\n")
+cat("acc_psi : min/median/max of (replicate-wise medians):",
+    round(min(accPsi_med),3), "/",
+    round(median(accPsi_med),3), "/",
+    round(max(accPsi_med),3), "\n")
+
+# beta_med_mat is the 100 x 20 matrix you can further inspect
+# View first 6 rows:
+# head(beta_med_mat)
